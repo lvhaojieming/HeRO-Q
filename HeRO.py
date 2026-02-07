@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from typing import Dict, List, Optional
-sys.path.insert(0, '/home/zjh/Megatron-LM')
+sys.path.insert(0, '/path/to/Megatron-LM')
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from verify_hroq_plus import (
@@ -117,35 +117,16 @@ def quantize_weight_gptq_actorder(W, H, bits=4, group_size=128, percdamp=0.01, a
             
     return W_q.to(orig_dtype), scales.to(orig_dtype)
 
-# ==============================================================================
-# 2. H-RoQ+ CORE MATH (CORRECTED)
-# ==============================================================================
 
 def get_hroq_transform(H, alpha, R):
-    """
-    Constructs T such that W_tilde = W @ T and H_tilde = T^-1 @ H @ T^-T is smooth.
-    To get H_tilde = D_alpha^-1 @ H @ D_alpha^-1, we need T^-1 = D_alpha^-1.
-    Thus, T = D_alpha.
-    Incorporating rotation: T = D_alpha @ R.
-    """
     H_diag = torch.abs(torch.diag(H))
     epsilon = H_diag.median() * 1e-3 + 1e-6
     H_diag = torch.clamp(H_diag, min=epsilon)
-    
-    # D_alpha elements: Scale UP the important channels
-    # Important channels (Large H_ii) get larger weights to preserve precision
     scale = (H_diag ** (alpha / 2.0))
     scale = scale / scale.mean()
     scale = torch.clamp(scale, min=0.1, max=10.0)
-    
-    # T = D_alpha @ R
-    # Equivalent to row-scaling R: T_ij = scale_i * R_ij
     T = scale.unsqueeze(1) * R
-    
-    # T_inv = R^T @ D_alpha^-1
-    # Equivalent to column-scaling R^T: T_inv_ij = R_ji / scale_j
-    T_inv = R.T * (1.0 / scale).unsqueeze(0)
-    
+    T_inv = R.T * (1.0 / scale).unsqueeze(0)   
     return T, T_inv
 
 def learn_rotation_with_diagonal_smoothing(
@@ -159,7 +140,6 @@ def learn_rotation_with_diagonal_smoothing(
     lr: float = 5e-4,
     init: str = 'hadamard'
 ) -> torch.Tensor:
-    """Learn R for T = D_alpha @ R"""
     d_in = W.shape[1]
     device = W.device
     
@@ -212,12 +192,8 @@ def learn_rotation_with_diagonal_smoothing(
         if loss.item() < best_loss:
             best_loss = loss.item()
             best_R = R.detach().clone()
-            
     return best_R.to(W.dtype)
 
-# ==============================================================================
-# 3. EXPERIMENT PIPELINE
-# ==============================================================================
 
 def find_optimal_alpha(W_orig, H, X, alphas, bits, group_size, device, 
                        use_learned_rotation=False, rotation_epochs=100, rotation_lr=1e-3):
@@ -229,7 +205,6 @@ def find_optimal_alpha(W_orig, H, X, alphas, bits, group_size, device,
     def get_mse(W_q_dequant):
         return torch.mean((X_float @ W_orig.float().T - X_float @ W_q_dequant.float().T) ** 2).item()
     
-    # 1. Baseline GPTQ (Must use Act-Order=True for strong baseline)
     W_q_bs, _ = quantize_weight_gptq_actorder(W_orig, H, bits, group_size, actorder=True)
     mse_gptq = get_mse(W_q_bs)
     
@@ -239,8 +214,6 @@ def find_optimal_alpha(W_orig, H, X, alphas, bits, group_size, device,
     
     results_dict = {'mse_gptq': mse_gptq, 'mse_rot_only': None, 'mse_rot_alpha': None}
     
-    # Pre-Rotation Damping: Critical for numerical stability of T_inv @ H @ T_inv.T
-    # This prevents H_tilde from becoming indefinite due to FP errors.
     H.diagonal().add_(1e-2 * torch.mean(torch.diag(H)))
     
     R_random = generate_random_orthogonal(d, H.device, H.dtype)
@@ -248,36 +221,26 @@ def find_optimal_alpha(W_orig, H, X, alphas, bits, group_size, device,
     for alpha in alphas:
         R = learn_rotation_with_diagonal_smoothing(W_orig, H, X, alpha, bits, group_size, rotation_epochs, rotation_lr) if use_learned_rotation else R_random
         T, T_inv = get_hroq_transform(H, alpha, R)
-        
-        # Correct Hessian for GPTQ: H_tilde = T_inv @ H @ T_inv.T
         H_tilde = T_inv.double() @ H.double() @ T_inv.T.double()
-        # Rotation destroys sparsity, so Act-Order is less useful/stable here. use actorder=False
         W_q_tilde, _ = quantize_weight_gptq_actorder(W_orig.double() @ T.double(), H_tilde, bits, group_size, actorder=False)
         W_dq = W_q_tilde.double() @ T_inv.double()
-        
         mse = get_mse(W_dq)
         if alpha == 0.0: results_dict['mse_rot_only'] = mse
         elif results_dict['mse_rot_alpha'] is None or mse < results_dict['mse_rot_alpha']: results_dict['mse_rot_alpha'] = mse
         
-        # --- DIAGNOSTICS FOR EXPLOSION ---
         if mse > 1.0:
             print(f"\n  [Explosion Detected] Alpha={alpha:.2f} MSE={mse:.2e}")
             try:
-                # 1. Check Hessian Condition
                 evals = torch.linalg.eigvalsh(H_tilde.float())
                 cond = evals.max() / (evals.min() + 1e-8)
                 print(f"    - H_tilde Condition Number: {cond:.2e}")
                 print(f"    - H_tilde Diag range: [{H_tilde.diag().min():.2e}, {H_tilde.diag().max():.2e}]")
-                
-                # 2. Check Weight Distribution
                 W_trans = W_orig.double() @ T.double()
                 print(f"    - W_trans range: [{W_trans.min():.2f}, {W_trans.max():.2f}]")
                 
-                # 3. Check Transform T
                 print(f"    - T range: [{T.min():.2e}, {T.max():.2e}]")
             except Exception as e:
                 print(f"    - Diagnostics failed: {e}")
-        # ---------------------------------
             
         if mse < best_mse:
             best_mse, best_alpha, best_T, best_T_inv = mse, alpha, T, T_inv
@@ -350,7 +313,7 @@ def main():
         torch.cuda.manual_seed_all(42)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='/home/zjh/model/Llama-3.2-3B-Instruct')
+    parser.add_argument('--model_path', type=str, default='/path/to/model/Llama-3.2-3B-Instruct')
     parser.add_argument('--bits', type=int, default=4)
     parser.add_argument('--group_size', type=int, default=128)
     parser.add_argument('--num_calib_samples', type=int, default=128)
@@ -366,8 +329,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map=device, torch_dtype=torch.float16, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
-    calib_tokens = load_c4_data('/home/zjh/c4_megatron/train', 'c4_train_0_text_document', args.num_calib_samples)
-    eval_tokens = load_c4_data('/home/zjh/c4_megatron/valid', 'c4_valid_0_text_document', 64)
+    calib_tokens = load_c4_data('/path/to/c4_megatron/train', 'c4_train_0_text_document', args.num_calib_samples)
+    eval_tokens = load_c4_data('/path/to/c4_megatron/valid', 'c4_valid_0_text_document', 64)
     
     print(f"Original PPL: {evaluate_ppl(model, eval_tokens, device):.4f}")
     
