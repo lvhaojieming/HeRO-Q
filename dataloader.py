@@ -21,8 +21,8 @@ from megatron.core.datasets.utils import Split
 from megatron.core.tokenizers import MegatronTokenizerBase
 
 
-DEFAULT_MODEL_PATH = "/home/zjh/model/Qwen-2.5-3B-Instruct"
-DEFAULT_DATA_PATH = "/home/zjh/C4_Qwen/C4_Qwen_text_document"
+DEFAULT_MODEL_PATH = "/path/to/model/Qwen-2.5-3B-Instruct"
+DEFAULT_DATA_PATH = "/path/to/C4_Qwen/C4_Qwen_text_document"
 
 
 def setup_logger(rank):
