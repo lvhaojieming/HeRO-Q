@@ -12,15 +12,15 @@ import unicodedata
 import html
 
 
-INPUT_DIR = "/home/zjh/dataset/C4_Qwen/en"
+INPUT_DIR = "/path/to/dataset/C4_Qwen/en"
 INPUT_FILE = os.path.join(INPUT_DIR, "c4_deepspeed_merged.jsonl") 
 OUTPUT_FILE = os.path.join(INPUT_DIR, "c4_cleaned_full.jsonl")
-FASTTEXT_MODEL_PATH = "/home/zjh/model/lid.176.bin"
+FASTTEXT_MODEL_PATH = "/path/to/model/lid.176.bin"
 MIN_LENGTH = 100            
 MAX_LENGTH = 100000         
 MIN_AVG_LINE_LENGTH = 10    
-MAX_SYMBOL_RATIO = 0.15     # 稍微放宽
-MIN_READABILITY_SCORE = 0   # 暂时设为0进行排查
+MAX_SYMBOL_RATIO = 0.15     
+MIN_READABILITY_SCORE = 0   
 NUM_PERM = 128              
 LSH_THRESHOLD = 0.8         
 
@@ -107,8 +107,6 @@ def main():
     print("Starting comprehensive data cleaning...")
     print(f"Input: {INPUT_FILE}")
     print(f"Output: {OUTPUT_FILE}")
-    
-    # 读取所有行
     lines = []
     if os.path.exists(INPUT_FILE):
         with open(INPUT_FILE, 'r', encoding='utf-8') as f:
@@ -116,15 +114,12 @@ def main():
     else:
         print(f"Error: Input file {INPUT_FILE} not found.")
         return
-
     total_count = len(lines)
     print(f"Loaded {total_count} lines. Processing...")
-
     reasons = Counter()
 
     with Pool(processes=cpu_count(), initializer=init_worker) as pool:
         results = list(tqdm(pool.imap(process_line, lines), total=total_count, desc="Cleaning & Filtering"))
-    
     print("\nFiltering Stats:")
     for res in results:
         if res:
@@ -144,14 +139,10 @@ def main():
                 
             item = res['item']
             mh = res['minhash']
-            
-            # 使用 MinHash 摘要进行近似去重
             digest = str(mh.digest())
             if digest in seen_hashes:
                 continue
             seen_hashes.add(digest)
-            
-            # 移除 URL 字段 (如果存在)
             item.pop('url', None)
             
             f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
