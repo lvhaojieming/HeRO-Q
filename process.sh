@@ -1,7 +1,7 @@
-MEGATRON_PATH="/home/zjh/Megatron-LM"
-INPUT_DATA="/home/zjh/dataset/C4_Qwen/en/c4_cleaned_full.jsonl"
-OUTPUT_PREFIX="C4_Qwen" 
-MODEL_ID="/home/zjh/model/Qwen-2.5-3B-Instruct" 
+MEGATRON_PATH="/path/to/Megatron-LM"
+INPUT_DATA="/path/to/dataset/C4"
+OUTPUT_PREFIX="C4" 
+MODEL_ID="/path/to/model/" 
 
 export PYTHONPATH=$MEGATRON_PATH:$PYTHONPATH
 
