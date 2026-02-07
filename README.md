@@ -13,3 +13,6 @@ To ensure reproducibility and rigorous performance evaluation, all experiments p
 * **CUDA Version:** [Insert your CUDA version, 12.8]
 * **PyTorch Version:** [Insert your PyTorch version, 2.1.2]
 * **Dependencies:** Please refer to `environment.yml` for the complete list of libraries.
+* 
+![HeRO-Q Framework](F1.pdf)
+> Figure 2: Overview of the HeRo-Q Inference Pipeline.We adopt a hybrid deployment strategy for the transformation $\mathbf{T} \triangleq \mathbf{D}_{\alpha}^{-1}\mathbf{R}$. Purple blocks denote mergeable transformations, where $\mathbf{T}$ or $\mathbf{T}^{-1}$ is fused offline into the adjacent weights ($\mathbf{W}_{q,k,v,o}$ and MLP weights), incurring zero runtime overhead. Grey blocks indicate \textit{online transformations} required where structural fusion is blocked (before RoPE or for KV-cache quantization), which are executed efficiently using optimized kernels.
