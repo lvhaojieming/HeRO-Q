@@ -568,7 +568,7 @@ def main():
     parser.add_argument('--model_type', type=str, default='fp16', choices=['fp16', 'gptq', 'awq', 'gguf'])
     parser.add_argument('--gguf_file', type=str, default=None, help='GGUF filename (required for gguf type)')
     parser.add_argument('--m_matrix_path', type=str, default=None)
-    parser.add_argument('--dataset_root', type=str, default='/home/zjh/dataset')
+    parser.add_argument('--dataset_root', type=str, default='/path/to/dataset')
     parser.add_argument('--tasks', type=str, default='gsm8k', help='Comma-separated: gsm8k,mmlu,humaneval,hellaswag')
     parser.add_argument('--num_fewshot', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=12)
