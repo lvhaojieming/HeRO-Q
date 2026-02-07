@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import argparse
-sys.path.insert(0, '/home/zjh/Megatron-LM')
+sys.path.insert(0, 'path/to/Megatron-LM')
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 import transformers.activations as activations
 if not hasattr(activations, 'PytorchGELUTanh'):
@@ -57,7 +57,7 @@ def evaluate_ppl(model, all_tokens, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
-    parser.add_argument('--dataset_path', type=str, default='/home/zjh/Megatron_Qwen')
+    parser.add_argument('--dataset_path', type=str, default='path/to/Megatron')
     parser.add_argument('--dataset_prefix', type=str, default='c4_qwen_text_document')
     parser.add_argument('--num_samples', type=int, default=2560)
     parser.add_argument('--seq_len', type=int, default=2048)
