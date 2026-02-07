@@ -220,30 +220,6 @@ def learn_rotation_with_alpha(
     init: str = 'hadamard',
     verbose: bool = False,
 ) -> torch.Tensor:
-    """
-    改进的学习旋转：使用输出 MSE 损失 (SpinQuant 风格)
-    
-    学习目标: R* = argmin_R ||X @ W - X @ W_dq||
-    
-    其中:
-        T = L_α @ R
-        W_dq = Q(W @ T) @ T^(-1)
-    
-    Args:
-        W: 原始权重 [d_out, d_in]
-        H: Hessian 矩阵 [d_in, d_in] (如果 X 为 None 则使用 Hessian 损失)
-        X: 激活矩阵 [n_samples, d_in] (如果提供则使用输出 MSE)
-        alpha: preconditioning 强度
-        bits: 量化位数
-        group_size: 量化分组大小 (与 GPTQ 一致)
-        epochs: 训练轮数
-        lr: 学习率
-        init: 初始化方式
-        verbose: 是否打印训练过程
-    
-    Returns:
-        R: 学习到的旋转矩阵 [d_in, d_in]
-    """
     d_in = W.shape[1]
     device = W.device
     dtype = W.dtype
@@ -325,27 +301,6 @@ def learn_rotation_with_alpha(
 
 
 def compute_transformation_matrix(H, alpha=0.2, use_rotation=True, eps=1e-6):
-    """
-    计算完整的变换矩阵 T = L_α · R^T
-    
-    Args:
-        H: Hessian 矩阵
-        alpha: Preconditioning 强度
-        use_rotation: 是否使用随机旋转
-    
-    Returns:
-        T: 变换矩阵
-        L_alpha: Preconditioner
-        R: 旋转矩阵 (如果使用)
-    """
-    d = H.shape[0]
-    device = H.device
-    dtype = H.dtype
-    
-    # 计算 α-Preconditioner
-    L_alpha, eigenvalues, eigenvectors = compute_alpha_preconditioner(H, alpha, eps)
-    
-    # 生成随机旋转矩阵
     if use_rotation:
         R = generate_random_orthogonal(d, device, dtype)
     else:
@@ -415,103 +370,51 @@ def compute_awq_scale(W, X, bits=4, grid_size=20):
 def quantize_weight_awq(W, X, bits=4):
     W = W.double()
     X = X.double()
-    
-    # 计算 AWQ 缩放因子
     s, alpha = compute_awq_scale(W, X, bits)
-    
-    # 缩放权重
     W_scaled = W * s.unsqueeze(0)
-    
-    # 量化
     W_q, scale = quantize_weight_rtn(W_scaled.float(), bits)
     W_q = W_q.double()
-    
-    # 反缩放
     W_dq = W_q / s.unsqueeze(0)
     
     return W_dq.float(), s, alpha
 
-
-# ==================== SmoothQuant 仿真 ====================
 def compute_smoothquant_scale(W, X, alpha=0.5):
-    """
-    SmoothQuant: 平滑激活和权重的分布
-    
-    核心思想：将激活的难度转移到权重上
-    s_j = max(|X_j|)^alpha / max(|W_j|)^(1-alpha)
-    
-    然后: X_new = X / s, W_new = W * s
-    """
     W = W.double()
     X = X.double()
-    
-    # 计算每个通道的最大值
     act_max = X.abs().max(dim=0)[0]  # [d_in]
     weight_max = W.abs().max(dim=0)[0]  # [d_in]
-    
-    # 避免除零
     act_max = torch.clamp(act_max, min=1e-8)
     weight_max = torch.clamp(weight_max, min=1e-8)
-    
-    # SmoothQuant 缩放因子
     s = (act_max.pow(alpha) / weight_max.pow(1 - alpha))
     s = torch.clamp(s, min=1e-4, max=1e4)
     
     return s
 
 def quantize_weight_smoothquant(W, X, bits=4, alpha=0.5):
-    """
-    SmoothQuant 量化
-    """
     W = W.double()
-    
-    # 计算 SmoothQuant 缩放因子
     s = compute_smoothquant_scale(W, X, alpha)
-    
-    # 缩放权重 (W_new = W * s)
     W_scaled = W * s.unsqueeze(0)
-    
-    # 量化
     W_q, scale = quantize_weight_rtn(W_scaled.float(), bits)
     W_q = W_q.double()
-    
-    # 反缩放 (恢复原始空间)
     W_dq = W_q / s.unsqueeze(0)
-    
     return W_dq.float(), s
 
 def quantize_weight_gptq_actorder(W, H, bits=4, group_size=128, percdamp=0.01, verbose=False):
-    """
-    GPTQ with Act-Order - 按 Hessian 对角线大小排序列，优先量化重要列
-    
-    Act-Order 的核心思想：
-    1. 按 Hessian 对角线（激活重要性）降序排列列
-    2. 优先量化重要的列，让误差补偿更有效
-    3. 最后恢复原始列顺序
-    """
     d_out, d_in = W.shape
     device = W.device
     orig_dtype = W.dtype
-    
     W = W.double()
     H = H.double()
-    
-    # 计算 damping
     diag_mean = torch.mean(torch.diag(H))
     damp = percdamp * diag_mean
     H = H.clone()
     H.diagonal().add_(damp)
-    
-    # ========== Act-Order: 按 Hessian 对角线排序 ==========
     diag = torch.diag(H)
-    perm = torch.argsort(diag, descending=True)  # 重要列优先
-    inv_perm = torch.argsort(perm)  # 用于恢复原始顺序
-    
-    # 重排 W 和 H
+    perm = torch.argsort(diag, descending=True)  
+    inv_perm = torch.argsort(perm) 
     W = W[:, perm]
     H = H[perm][:, perm]
     
-    # ========== 标准 GPTQ: 双重 Cholesky ==========
     try:
         L = torch.linalg.cholesky(H)
         H_inv = torch.cholesky_inverse(L)
@@ -521,10 +424,8 @@ def quantize_weight_gptq_actorder(W, H, bits=4, group_size=128, percdamp=0.01, v
             print(f"  [GPTQ Debug] Cholesky failed: {e}, using fallback")
         H_inv = torch.linalg.pinv(H)
         Hinv = H_inv
-    
     W_q = W.clone()
     
-    # ========== Group-wise scale (在排序后的空间计算) ==========
     n_groups = (d_in + group_size - 1) // group_size
     scales = torch.zeros(d_out, n_groups, device=device, dtype=torch.float64)
     
@@ -537,7 +438,6 @@ def quantize_weight_gptq_actorder(W, H, bits=4, group_size=128, percdamp=0.01, v
     
     scales = torch.clamp(scales, min=1e-10)
     
-    # ========== GPTQ 核心：逐列量化 + 误差补偿 ==========
     block_size = 128
     for i1 in range(0, d_in, block_size):
         i2 = min(i1 + block_size, d_in)
@@ -557,20 +457,15 @@ def quantize_weight_gptq_actorder(W, H, bits=4, group_size=128, percdamp=0.01, v
             
             q = torch.round(w / scale_col)
             q = torch.clamp(q, -(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
-            q = q * scale_col
-            
+            q = q * scale_col 
             Q1[:, i] = q
-            
             err1 = (w - q) / d
             W1[:, i:] -= err1.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
             Err1[:, i] = err1
-        
         W_q[:, i1:i2] = Q1
-        
         if i2 < d_in:
             W_q[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
-    
-    # ========== 恢复原始列顺序 ==========
+
     W_q = W_q[:, inv_perm]
     
     if verbose:
@@ -584,16 +479,11 @@ def quantize_weight_gptq_groupwise(W, H, bits=4, group_size=128, block_size=128,
     orig_dtype = W.dtype
     W = W.double()
     H = H.double()
-    
-    # 计算 damping
     diag_mean = torch.mean(torch.diag(H))
     damp = percdamp * diag_mean
-    
-    # 添加 damping
     H = H.clone()
     H.diagonal().add_(damp)
     
-    # ========== 标准 GPTQ: 双重 Cholesky ==========
     try:
         L = torch.linalg.cholesky(H)
         H_inv = torch.cholesky_inverse(L)
@@ -605,9 +495,6 @@ def quantize_weight_gptq_groupwise(W, H, bits=4, group_size=128, block_size=128,
         Hinv = H_inv
     
     W_q = W.clone()
-    
-    # ========== Group-wise scale 计算 ==========
-    # 将输入维度分成多个 group，每个 group 有独立的 scale
     n_groups = (d_in + group_size - 1) // group_size
     scales = torch.zeros(d_out, n_groups, device=device, dtype=torch.float64)
     
@@ -619,8 +506,6 @@ def quantize_weight_gptq_groupwise(W, H, bits=4, group_size=128, block_size=128,
         scales[:, g] = max_val / (2 ** (bits - 1) - 1)
     
     scales = torch.clamp(scales, min=1e-10)
-    
-    # ========== GPTQ 核心：逐列量化 + 误差补偿 ==========
     for i1 in range(0, d_in, block_size):
         i2 = min(i1 + block_size, d_in)
         
@@ -636,22 +521,18 @@ def quantize_weight_gptq_groupwise(W, H, bits=4, group_size=128, block_size=128,
             
             w = W1[:, i]
             d = Hinv1[i, i]
-            
-            # 量化 (使用 group-wise scale)
+        
             q = torch.round(w / scale_col)
             q = torch.clamp(q, -(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
             q = q * scale_col
             
             Q1[:, i] = q
             
-            # 误差补偿
             err1 = (w - q) / d
             W1[:, i:] -= err1.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
             Err1[:, i] = err1
         
         W_q[:, i1:i2] = Q1
-        
-        # Block 间误差传播
         if i2 < d_in:
             W_q[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
     
@@ -661,32 +542,18 @@ def quantize_weight_gptq_groupwise(W, H, bits=4, group_size=128, block_size=128,
     return W_q.to(orig_dtype), scales.to(orig_dtype)
 
 def quantize_weight_gptq_simple(W, H, bits=4, block_size=128, percdamp=0.01, verbose=False):
-    """
-    GPTQ 量化 - 严格按照 AutoGPTQ 标准实现 (per-row scale)
-    
-    标准 GPTQ 流程:
-        1. H_reg = H + damp * I
-        2. L = cholesky(H_reg)
-        3. H_inv = cholesky_inverse(L)
-        4. Hinv = cholesky(H_inv, upper=True)  # 关键：对 H^{-1} 再做上三角 Cholesky
-        5. 逐列量化: err = (w - q) / Hinv[i,i], W[:, i:] -= err @ Hinv[i, i:]
-    """
     d_out, d_in = W.shape
     device = W.device
     orig_dtype = W.dtype
-    
-    # ========== 强制 FP64 ==========
     W = W.double()
     H = H.double()
-    
-    # 计算 damping (标准做法)
+
     diag_mean = torch.mean(torch.diag(H))
     damp = percdamp * diag_mean
     
     if verbose:
         print(f"  [GPTQ Debug] diag_mean={diag_mean:.6e}, damp={damp:.6e}, percdamp={percdamp}")
-    
-    # 添加 damping
+
     H = H.clone()
     H.diagonal().add_(damp)
 
@@ -705,15 +572,11 @@ def quantize_weight_gptq_simple(W, H, bits=4, block_size=128, percdamp=0.01, ver
         Hinv = H_inv
     
     W_q = W.clone()
-    
-    # 预计算 scale (per-row, 基于原始权重)
     max_val = W.abs().max(dim=-1, keepdim=True)[0]
     scale = max_val / (2 ** (bits - 1) - 1)
     scale = torch.clamp(scale, min=1e-10)
     scale_flat = scale.squeeze()  # [d_out]
     
-    # ========== GPTQ 核心：逐列量化 + 误差补偿 ==========
-    # 按 block 处理以提高效率
     for i1 in range(0, d_in, block_size):
         i2 = min(i1 + block_size, d_in)
         
@@ -726,21 +589,19 @@ def quantize_weight_gptq_simple(W, H, bits=4, block_size=128, percdamp=0.01, ver
             w = W1[:, i]
             d = Hinv1[i, i]
             
-            # 量化
+
             q = torch.round(w / scale_flat)
             q = torch.clamp(q, -(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
             q = q * scale_flat
             
             Q1[:, i] = q
             
-            # 误差补偿 (标准 GPTQ 公式)
             err1 = (w - q) / d
             W1[:, i:] -= err1.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
             Err1[:, i] = err1
         
         W_q[:, i1:i2] = Q1
-        
-        # Block 间误差传播
+
         if i2 < d_in:
             W_q[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
     
@@ -750,27 +611,17 @@ def quantize_weight_gptq_simple(W, H, bits=4, block_size=128, percdamp=0.01, ver
     return W_q.to(orig_dtype), scale.to(orig_dtype)
 
 def compute_quantization_error(W_orig, W_quant, H):
-    """
-    计算量化误差: Tr((W - Ŵ) H (W - Ŵ)^T)
-    
-    注意：这是输出空间的误差，等价于 ||X(W-Ŵ)^T||_F^2
-    """
-    # 使用 FP64 计算误差
     delta = (W_orig - W_quant).double()
     H = H.double()
-    # Tr(delta @ H @ delta^T) = sum_i (delta[i,:] @ H @ delta[i,:]^T)
-    # 更稳定的计算方式
     error = torch.sum(delta * (delta @ H))
     return error.item()
 
 def compute_condition_number(H, eps=1e-8):
-    """计算 Hessian 的条件数""" 
     eigenvalues = torch.linalg.eigvalsh(H)
     eigenvalues = torch.clamp(eigenvalues, min=eps)
     return (eigenvalues.max() / eigenvalues.min()).item()
 
 def analyze_weight_distribution(W, name=""):
-    """分析权重分布""" 
     W_flat = W.flatten()
     stats = {
         'mean': W_flat.mean().item(),
@@ -782,26 +633,17 @@ def analyze_weight_distribution(W, name=""):
     return stats
 
 def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
-    """
-    运行 H-RoQ+ 实验
-    
-    比较不同 alpha 值下的量化效果
-    """
     print(f"\n{'='*70}")
     print(f"H-RoQ+ Experiment on Layer {layer_idx}")
     print(f"{'='*70}")
     
-    # 获取目标层
     layers = model.model.layers if hasattr(model, 'model') else model.layers
     layer = layers[layer_idx]
     
-    # 选择要量化的权重 (以 MLP down_proj 为例)
     target_module = layer.mlp.down_proj
     W_orig = target_module.weight.data.clone().float()
     print(f"\nTarget: layer.mlp.down_proj")
     print(f"Weight shape: {W_orig.shape}")
-    
-    # 收集激活值来计算 Hessian
     print(f"\nCollecting activations for Hessian computation...")
     dataloader = create_dataloader(
         tokenizer, args.dataset_path, args.dataset_prefix, 
@@ -817,8 +659,6 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
         else:
             inp = input
         activations.append(inp.detach().cpu())
-    
-    # 注册 hook 到 down_proj 的输入
     hook = target_module.register_forward_hook(hook_fn)
     hooks.append(hook)
     
@@ -827,29 +667,23 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
         for batch in tqdm(dataloader, desc="Collecting activations"):
             tokens = batch['tokens'].to(device)
             _ = model(tokens)
-    
-    # 移除 hooks
     for h in hooks:
         h.remove()
-    
-    # 合并激活值
+
     X = torch.cat([a.reshape(-1, a.shape[-1]) for a in activations], dim=0)
     print(f"Activation shape: {X.shape}")
-    
-    # 计算 Hessian
+
     print(f"\nComputing Hessian matrix...")
     X = X.to(device).float()
     H = compute_hessian(X)
     print(f"Hessian shape: {H.shape}")
     print(f"Original condition number: {compute_condition_number(H):.2e}")
-    
-    # 分析原始权重分布
+
     orig_stats = analyze_weight_distribution(W_orig, "Original")
     print(f"\nOriginal weight stats:")
     print(f"  Mean: {orig_stats['mean']:.6f}, Std: {orig_stats['std']:.6f}")
     print(f"  Outlier ratio: {orig_stats['outlier_ratio']*100:.2f}%")
-    
-    # 测试不同的 alpha 值 (更细粒度)
+
     alphas = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0]
     results = {}
     
@@ -858,8 +692,7 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
     print(f"{'='*70}")
     print(f"{ 'Alpha':<8} | {'Cond(H̃)':<15} | {'RTN Error':<15} | {'GPTQ Error':<15} | {'Improvement'}")
     print(f"{'-'*70}")
-    
-    # Baseline: 原始空间的量化误差
+
     print(f"\n[Debug] Baseline GPTQ:")
     W_rtn_baseline, _ = quantize_weight_rtn(W_orig.to(device), bits=args.bits)
     error_rtn_baseline = compute_quantization_error(W_orig.to(device), W_rtn_baseline, H)
@@ -876,41 +709,27 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
     }
     
     for alpha in alphas:
-        # 计算变换矩阵 T = L_α · R^T
         if args.learned_rotation:
-            # 使用学习旋转 (SpinQuant style)
             T, L_alpha, R, eigenvalues = compute_transformation_matrix_learned(
                 W_orig.to(device), H, alpha=alpha, bits=args.bits,
                 epochs=args.rotation_epochs, lr=args.rotation_lr,
-                verbose=(alpha == alphas[0])  # 只在第一个 alpha 打印详情
+                verbose=(alpha == alphas[0])  
             )
         else:
-            # 使用随机 Hadamard 旋转
             T, L_alpha, R, eigenvalues = compute_transformation_matrix(
                 H, alpha=alpha, use_rotation=args.use_rotation
             )
         
-        # 变换后的 Hessian: H̃ = T^T · H · T
         H_tilde = transform_hessian(H, T)
         cond_H_tilde = compute_condition_number(H_tilde)
-        
-        # 变换权重到新空间: W̃ = W · T
         W_tilde = W_orig.to(device) @ T
-        
-        # 在新空间中量化
         W_tilde_rtn, _ = quantize_weight_rtn(W_tilde, bits=args.bits)
         W_tilde_gptq, _ = quantize_weight_gptq_simple(W_tilde, H_tilde, bits=args.bits)
-        
-        # 逆变换回原空间: Ŵ = W̃_q · T^(-1)
         T_inv = torch.linalg.inv(T)
         W_rtn_recovered = W_tilde_rtn @ T_inv
         W_gptq_recovered = W_tilde_gptq @ T_inv
-        
-        # 计算原空间的量化误差
         error_rtn = compute_quantization_error(W_orig.to(device), W_rtn_recovered, H)
         error_gptq = compute_quantization_error(W_orig.to(device), W_gptq_recovered, H)
-        
-        # 相对于 baseline 的改进
         improvement = (error_gptq_baseline - error_gptq) / error_gptq_baseline * 100
         
         print(f"{alpha:<8.2f} | {cond_H_tilde:<15.2e} | {error_rtn:<15.4e} | {error_gptq:<15.4e} | {improvement:+.2f}%")
@@ -924,25 +743,18 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
         }
     
     print(f"{'='*70}")
-    
-    # 找出最优 alpha (用于 H-RoQ+)
     best_alpha = min([a for a in alphas], key=lambda a: results[a]['gptq_error'])
     print(f"\nBest alpha for H-RoQ+: {best_alpha}")
     print(f"Best GPTQ error: {results[best_alpha]['gptq_error']:.4e}")
     print(f"Improvement over baseline: {results[best_alpha]['improvement']:.2f}%")
-    
-    # ==================== 对比其他方法 ====================
     print(f"\n{'='*70}")
     print(f"Comparing with other methods (AWQ, SmoothQuant, SpinQuant, H-RoQ+)...")
     print(f"{'='*70}")
-    
-    # 1. AWQ
+
     print(f"\n[AWQ] Computing...")
     W_awq, awq_scale, awq_alpha = quantize_weight_awq(W_orig.to(device), X, bits=args.bits)
     error_awq = compute_quantization_error(W_orig.to(device), W_awq, H)
     print(f"  AWQ optimal alpha: {awq_alpha:.2f}")
-    
-    # 2. SmoothQuant (多个 alpha)
     print(f"\n[SmoothQuant] Computing...")
     best_sq_error = float('inf')
     best_sq_alpha = 0.5
@@ -953,17 +765,8 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
             best_sq_error = error_sq
             best_sq_alpha = sq_alpha
     print(f"  SmoothQuant optimal alpha: {best_sq_alpha}")
-    
-    # 3. SpinQuant (α=0, 只有旋转)
     error_spinquant = results[0.0]['gptq_error']
-    
-    # 4. H-RoQ+ (最优 α + 旋转 + GPTQ)
     error_hroq_plus = results[best_alpha]['gptq_error']
-    
-    # 5. Pure H-RoQ (α=1, 完全白化)
-    error_pure_hroq = results[1.0]['gptq_error']
-    
-    # ==================== 汇总对比 ====================
     print(f"\n{'='*80}")
     print(f"{ 'METHOD COMPARISON SUMMARY':^80}")
     print(f"{'='*80}")
@@ -987,8 +790,6 @@ def run_hroq_plus_experiment(model, tokenizer, layer_idx, device, args):
             print(f"{name:<25} | {error:<15.4e} | {vs_baseline:+14.2f}% | {vs_rtn:+14.2f}%")
     
     print(f"{'='*80}")
-    
-    # 存储对比结果
     results['comparison'] = {
         'rtn': error_rtn_baseline,
         'gptq': error_gptq_baseline,
@@ -1019,7 +820,7 @@ def main():
     parser.add_argument('--save_plot', action='store_true', default=True, help='Save visualization')
     parser.add_argument('--output_dir', type=str, default='./hroq_results', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
-    parser.add_argument('--dataset_path', type=str, default='/home/zjh/c4_megatron/train', help='Dataset path')
+    parser.add_argument('--dataset_path', type=str, default='path/to/c4_megatron/train', help='Dataset path')
     parser.add_argument('--dataset_prefix', type=str, default='c4_train_0_text_document', help='Dataset prefix')
     args = parser.parse_args()
     if args.no_rotation:
